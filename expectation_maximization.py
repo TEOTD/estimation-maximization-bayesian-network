@@ -1,92 +1,106 @@
-import numpy as np
 from collections import defaultdict
+
+import numpy as np
+import pandas as pd
+
+from gibbs_sampling import gibbs
 from loopy_bpe import sumprod
 
 
-def colorem(A, L, samples, s=0, t=None, bp_its=100, max_em_iter=50, learning_rate=0.1):
+def cutsem(A, L, samples, s=0, t=None, bp_its=1000, learning_rate=1.0, max_iter=1000):
     n = A.shape[0]
+    m = samples.shape[1]
     if t is None:
-        t = n - 1  # Assume t is the last node if not specified
+        t = n - 1
 
-    edges = [(i, j) for i in range(n) for j in range(n) if A[i, j] and i < j]
-    m_samples = samples.shape[1]
-
-    # Initialize weights (theta as log-weights)
+    edges = [(i, j) for i in range(n) for j in range(i + 1, n) if A[i, j]]
     theta = defaultdict(float)
     for edge in edges:
-        theta[edge] = 0.0  # Initial log-weight (w=exp(0)=1)
+        theta[edge] = 1.0
 
-    for _ in range(max_em_iter):
-        # E-step: Compute empirical edge disagreements
-        empirical = np.zeros_like(A, dtype=float)
+    for _ in range(max_iter):
+        w = np.zeros((n, n))
+        for (i, j) in edges:
+            w_ij = np.exp(theta[(i, j)])
+            w[i][j] = w_ij
+            w[j][i] = w_ij
 
-        for sample_idx in range(m_samples):
-            # Clamp observed variables (non-L) and s, t
-            observed_vars = {s: 1, t: 0}
-            for i in range(n):
-                if not L[i] and i != s and i != t:
-                    observed_vars[i] = samples[i, sample_idx]
+        expectations_empirical = np.zeros_like(A, dtype=float)
+        for sample_idx in range(m):
+            fixed_vars = {i: samples[i, sample_idx] for i in range(n) if L[i] == 0}
+            fixed_vars[s] = 1
+            fixed_vars[t] = 0
 
-            # Run BP with clamped observed variables
-            _, beliefs = sumprod_clamped(A, s, t, theta_to_weights(theta, edges), its=bp_its, observed=observed_vars)
+            _, beliefs = sumprod(A, s, t, w, its=bp_its, fixed_vars=fixed_vars)
 
-            # Accumulate empirical expectations
             for (i, j) in edges:
-                prob_01 = beliefs.get(((i, j), (0, 1)), 0)
-                prob_10 = beliefs.get(((i, j), (1, 0)), 0)
-                empirical[i, j] += prob_01 + prob_10
-                empirical[j, i] = empirical[i, j]
+                if i in fixed_vars and j in fixed_vars:
+                    disagreement = int(fixed_vars[i] != fixed_vars[j]) / m
+                else:
+                    prob_01 = beliefs.get(((i, j), (0, 1)), 0.0)
+                    prob_10 = beliefs.get(((i, j), (1, 0)), 0.0)
+                    disagreement = (prob_01 + prob_10) / m
+                expectations_empirical[i, j] += disagreement
+                expectations_empirical[j, i] += disagreement
 
-        empirical /= m_samples  # Average over samples
-
-        # M-step: Compute model expectations and update weights
-        # Run BP on full model (only s and t are clamped)
-        _, model_beliefs = sumprod_clamped(A, s, t, theta_to_weights(theta, edges), its=bp_its, observed={s: 1, t: 0})
-
-        model_expectations = np.zeros_like(A, dtype=float)
+        _, model_beliefs = sumprod(A, s, t, w, bp_its)
+        expectations_model = np.zeros_like(A, dtype=float)
         for (i, j) in edges:
-            prob_01 = model_beliefs.get(((i, j), (0, 1)), 0)
-            prob_10 = model_beliefs.get(((i, j), (1, 0)), 0)
-            model_expectations[i, j] = prob_01 + prob_10
-            model_expectations[j, i] = model_expectations[i, j]
+            prob_01 = model_beliefs.get(((i, j), (0, 1)), 0.0)
+            prob_10 = model_beliefs.get(((i, j), (1, 0)), 0.0)
+            expectations_model[i, j] = prob_01 + prob_10
+            expectations_model[j, i] = expectations_model[i, j]
 
-        # Update theta (log-weights) using gradient ascent
-        for (i, j) in edges:
-            grad = empirical[i, j] - model_expectations[i, j]
-            theta[(i, j)] += learning_rate * grad
+        for edge in edges:
+            gradient = expectations_empirical[edge] - expectations_model[edge]
+            delta = learning_rate * gradient
+            theta[edge] += delta
 
-    # Convert final theta to weights
-    w = np.zeros_like(A, dtype=float)
-    for (i, j) in edges:
-        w[i, j] = np.exp(theta[(i, j)])
-        w[j, i] = w[i, j]
-
-    return w
-
-
-def sumprod_clamped(M, s, t, w, its, observed):
-    """Modified sumprod to clamp observed variables."""
-
-    def phi(i, x_i):
-        if i in observed:
-            return 1.0 if x_i == observed[i] else 0.0
-        if i == s:
-            return x_i  # Enforce s=1
-        if i == t:
-            return 1 - x_i  # Enforce t=0
-        return 1.0
-
-    # The rest of the sumprod implementation with the custom phi
-    # (Refer to loopy_bpe.py and adjust to use the new phi)
-    # This is a simplified placeholder; actual implementation requires integrating the original sumprod code.
-    _, beliefs = sumprod(M, s, t, w, its)
-    return 1.0, beliefs  # Placeholder return
-
-
-def theta_to_weights(theta, edges):
-    n = max(max(i, j) for (i, j) in edges) + 1
     w = np.zeros((n, n))
     for (i, j) in edges:
-        w[i, j] = np.exp(theta[(i, j)])
-        w[j, i] = w[i, j]
+        w_ij = np.exp(theta[(i, j)])
+        w[i][j] = w_ij
+        w[j][i] = w_ij
     return w
+
+
+if __name__ == '__main__':
+    # Step 1: Define a 3-node chain graph: s(0) - A(1) - t(2)
+    A = np.array([[0, 1, 0], [1, 0, 1], [0, 1, 0]])
+    true_w = np.array([[0, np.exp(1), 0], [np.exp(1), 0, np.exp(1)], [0, np.exp(1), 0]])
+    s, t = 0, 2
+
+    # Step 2: Define observed variables (s, t) and latent variables (A)
+    L = np.array([0, 1, 0])  # 0=observed, 1=latent (node 1 is latent)
+
+    # Step 3: Generate samples with Gibbs (A is latent)
+    sample_sizes = [10 ** 1, 10 ** 2, 10 ** 3, 10 ** 4, 10 ** 5]
+    results = []
+
+    # Compute true partition function Z
+    z_true, _ = sumprod(A, s, t, true_w, its=1000)
+
+    for m in sample_sizes:
+        # Generate Gibbs samples (A is latent)
+        _, samples = gibbs(A, s=s, t=t, w=true_w, burnin=1000, its=m)
+
+        # Mask latent variable A (set to 2 to indicate missing)
+        latent_nodes = np.where(L == 1)[0]  # Nodes 3,4,5,6
+        samples[latent_nodes, :] = 999
+
+        # Learn weights using EM (cutsem)
+        learned_w = cutsem(A, L, samples, bp_its=1000, max_iter=1000)
+        print(learned_w)
+        # Estimate Z with learned weights
+        z_estimated, _ = sumprod(A, s, t, learned_w, its=1000)
+        results.append(z_estimated)
+
+    # Step 4: Compare results
+    df = pd.DataFrame({
+        "Samples": sample_sizes,
+        "Estimated Z": np.round(results, 4),
+        "True Z": np.round(z_true, 4)
+    })
+
+    print("\nEstimated Partition Function vs. True Z (with Latent Variables):")
+    print(df.to_markdown(index=False))
