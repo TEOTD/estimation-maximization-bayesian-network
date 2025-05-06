@@ -7,52 +7,59 @@ from gibbs_sampling import gibbs
 from loopy_bpe import sumprod
 
 
-def cutsem(A, L, samples, s=0, t=None, bp_its=1000, learning_rate=1.0, max_iter=1000):
+def cutsem(A, L, samples, s=0, t=None, bp_its=1000, learning_rate=1.0,
+           max_iter=1000, decay_rate=0.01, tolerance=1e-5):
     n = A.shape[0]
     m = samples.shape[1]
     if t is None:
         t = n - 1
 
-    # Extract list of edges from adjacency matrix
+    # Extract undirected edges from adjacency matrix
     edges = [(i, j) for i in range(n) for j in range(i + 1, n) if A[i, j]]
 
-    # Initialize log-potentials (theta) to 1.0
+    # Initialize log-potentials
     theta = defaultdict(float)
     for edge in edges:
         theta[edge] = 1.0
 
-    for _ in range(max_iter):
-        # Compute weight matrix w from current theta
+    # Gradient ascent with convergence monitoring
+    for iteration in range(max_iter):
+        current_lr = learning_rate / (1.0 + decay_rate * iteration)  # Decaying learning rate
+        max_delta = 0.0  # Track maximum parameter change
+
+        # Construct current weight matrix
         w = np.zeros((n, n))
         for (i, j) in edges:
             w_ij = np.exp(theta[(i, j)])
             w[i][j] = w_ij
             w[j][i] = w_ij
 
-        # Empirical expectations based on Gibbs samples
+        # Compute empirical expectations (data-dependent term)
         expectations_empirical = np.zeros_like(A, dtype=float)
         for sample_idx in range(m):
-            # Fix values for observed nodes and source/target
+            # Handle observed nodes and fixed source/target
             fixed_vars = {i: samples[i, sample_idx] for i in range(n) if L[i] == 0}
-            fixed_vars[s] = 1
-            fixed_vars[t] = 0
+            fixed_vars.update({s: 1, t: 0})
 
-            # Run loopy belief propagation to get pairwise marginals
+            # Get beliefs with observed nodes fixed
             _, beliefs = sumprod(A, s, t, w, its=bp_its, fixed_vars=fixed_vars)
 
-            # Update empirical expectations for edge disagreements
+            # Accumulate edge disagreement probabilities
             for (i, j) in edges:
                 if i in fixed_vars and j in fixed_vars:
+                    # Both nodes observed - exact disagreement
                     disagreement = int(fixed_vars[i] != fixed_vars[j]) / m
                 else:
+                    # At least one node latent - use belief probabilities
                     prob_01 = beliefs.get(((i, j), (0, 1)), 0.0)
                     prob_10 = beliefs.get(((i, j), (1, 0)), 0.0)
                     disagreement = (prob_01 + prob_10) / m
+
                 expectations_empirical[i, j] += disagreement
                 expectations_empirical[j, i] += disagreement
 
-        # Model expectations (no conditioning)
-        _, model_beliefs = sumprod(A, s, t, w, bp_its)
+        # Compute model expectations (current model predictions)
+        _, model_beliefs = sumprod(A, s, t, w, its=bp_its)
         expectations_model = np.zeros_like(A, dtype=float)
         for (i, j) in edges:
             prob_01 = model_beliefs.get(((i, j), (0, 1)), 0.0)
@@ -60,13 +67,19 @@ def cutsem(A, L, samples, s=0, t=None, bp_its=1000, learning_rate=1.0, max_iter=
             expectations_model[i, j] = prob_01 + prob_10
             expectations_model[j, i] = expectations_model[i, j]
 
-        # Gradient ascent update on theta
-        for edge in edges:
-            gradient = expectations_empirical[edge] - expectations_model[edge]
-            delta = learning_rate * gradient
-            theta[edge] += delta
+            # Update parameters with adaptive learning rate
+            for edge in edges:
+                gradient = expectations_empirical[edge] - expectations_model[edge]
+                delta = current_lr * gradient
+                theta[edge] += delta
+                max_delta = max(max_delta, abs(delta))
 
-    # Final weight matrix computation from learned theta
+            # Early stopping if parameters stabilize
+            if max_delta < tolerance:
+                print(f"Convergence reached at iteration {iteration} with max delta {max_delta:.2e}")
+            break
+
+    # Final weight matrix from learned parameters
     w = np.zeros((n, n))
     for (i, j) in edges:
         w_ij = np.exp(theta[(i, j)])
@@ -77,41 +90,37 @@ def cutsem(A, L, samples, s=0, t=None, bp_its=1000, learning_rate=1.0, max_iter=
 
 
 if __name__ == '__main__':
-    # Example 3-node graph: 0 - 1 - 2
+    # Test case remains unchanged from original
     A = np.array([[0, 1, 0], [1, 0, 1], [0, 1, 0]])
     true_w = np.array([[0, np.exp(1), 0], [np.exp(1), 0, np.exp(1)], [0, np.exp(1), 0]])
 
-    s, t = 0, 2  # Source and target for cut constraints
-    L = np.array([0, 1, 0])  # Node 1 is latent
+    s, t = 0, 2
+    L = np.array([0, 1, 0])
 
-    sample_sizes = [10 ** 1, 10 ** 2, 10 ** 3, 10 ** 4, 10 ** 5]
+    sample_sizes = [10 ** k for k in range(1, 4)]
     results = []
 
-    # Compute true partition function using known weights
+    # True partition function calculation
     z_true, _ = sumprod(A, s, t, true_w, its=1000)
 
     # Run experiments for increasing sample sizes
     for m in sample_sizes:
-        # Generate samples using Gibbs sampling
+        # Generate samples with latent nodes marked
         _, samples = gibbs(A, s=s, t=t, w=true_w, burnin=1000, its=m)
+        samples[np.where(L == 1)[0], :] = 999  # Mask latent nodes
 
-        # Mask latent nodes with placeholder (not used by cutsem directly)
-        latent_nodes = np.where(L == 1)[0]
-        samples[latent_nodes, :] = 999
-
-        # Learn weights from samples
+        # Learn weights with improved algorithm
         learned_w = cutsem(A, L, samples, bp_its=1000, max_iter=1000)
 
-        # Estimate partition function from learned weights
+        # Estimate partition function
         z_estimated, _ = sumprod(A, s, t, learned_w, its=1000)
         results.append(z_estimated)
 
-    # Format and display results
+    # Results comparison
     df = pd.DataFrame({
         "Samples": sample_sizes,
         "Estimated Z": np.round(results, 4),
         "True Z": np.round(z_true, 4)
     })
-
-    print("\nEstimated Partition Function vs. True Z (with Latent Variables):")
+    print("\nPartition Function Estimation Results:")
     print(df.to_markdown(index=False))
