@@ -65,37 +65,26 @@ def cutsem(A, L, samples, s=0, t=None, bp_its=1000, learning_rate=1.0, max_iter=
 
 
 if __name__ == '__main__':
-    # Step 1: Define a 3-node chain graph: s(0) - A(1) - t(2)
     A = np.array([[0, 1, 0], [1, 0, 1], [0, 1, 0]])
     true_w = np.array([[0, np.exp(1), 0], [np.exp(1), 0, np.exp(1)], [0, np.exp(1), 0]])
     s, t = 0, 2
 
-    # Step 2: Define observed variables (s, t) and latent variables (A)
-    L = np.array([0, 1, 0])  # 0=observed, 1=latent (node 1 is latent)
+    L = np.array([0, 1, 0])
 
-    # Step 3: Generate samples with Gibbs (A is latent)
     sample_sizes = [10 ** 1, 10 ** 2, 10 ** 3, 10 ** 4, 10 ** 5]
     results = []
 
-    # Compute true partition function Z
     z_true, _ = sumprod(A, s, t, true_w, its=1000)
 
     for m in sample_sizes:
-        # Generate Gibbs samples (A is latent)
         _, samples = gibbs(A, s=s, t=t, w=true_w, burnin=1000, its=m)
-
-        # Mask latent variable A (set to 2 to indicate missing)
-        latent_nodes = np.where(L == 1)[0]  # Nodes 3,4,5,6
+        latent_nodes = np.where(L == 1)[0]
         samples[latent_nodes, :] = 999
 
-        # Learn weights using EM (cutsem)
         learned_w = cutsem(A, L, samples, bp_its=1000, max_iter=1000)
-        print(learned_w)
-        # Estimate Z with learned weights
         z_estimated, _ = sumprod(A, s, t, learned_w, its=1000)
         results.append(z_estimated)
 
-    # Step 4: Compare results
     df = pd.DataFrame({
         "Samples": sample_sizes,
         "Estimated Z": np.round(results, 4),
